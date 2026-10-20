@@ -11,7 +11,7 @@ import ImageBox from "@site/src/components/ImageBox";
 
 # Tracing OpenCode
 
-[MLflow Tracing](/genai/tracing) provides automatic tracing for [OpenCode](https://opencode.ai), a terminal-based agentic coding tool that supports multiple LLM providers including Claude, OpenAI, Google, and local models.
+[MLflow Tracing](/genai/tracing) provides automatic tracing for [OpenCode V2](https://opencode.ai/v2/), a terminal-based agentic coding tool that supports multiple LLM providers including Claude, OpenAI, Google, and local models.
 
 <ImageBox src="/images/llms/opencode/opencode-tracing.png" alt="OpenCode Tracing" />
 
@@ -28,7 +28,7 @@ OpenCode tracing is configured using the `@mlflow/opencode` plugin and environme
 
 ### Requirements
 
-- [OpenCode CLI](https://opencode.ai) installed
+- [OpenCode V2 CLI](https://opencode.ai/v2/) installed
 - Node.js runtime (for the plugin)
 - The `@mlflow/opencode` npm package
 - An MLflow tracking server running
@@ -45,7 +45,8 @@ Add the plugin to your `opencode.json` file:
 
 ```json
 {
-  "plugin": ["@mlflow/opencode"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["@mlflow/opencode"]
 }
 ```
 
@@ -86,7 +87,14 @@ mlflow server
 opencode
 ```
 
-Traces will be automatically created when your OpenCode session becomes idle (after each conversation turn).
+Traces will be automatically created when your OpenCode session completes (after each conversation turn).
+
+OpenCode V2 can return a post-compaction context. The plugin merges ID-bearing messages retained across idle events,
+so later turns include available conversation history without retaining unbounded inactive session state.
+
+The V2 plugin retains message history observed during the active OpenCode process
+across context compaction. System, synthetic, skill, shell, and compaction records
+are treated as lifecycle metadata rather than conversation turns.
 
 ## Configuration Reference
 
@@ -96,6 +104,7 @@ The plugin is configured entirely via environment variables:
 | ----------------------- | -------- | ---------------------------------------------------------- |
 | `MLFLOW_TRACKING_URI`   | Yes      | MLflow tracking server URI (e.g., `http://localhost:5000`) |
 | `MLFLOW_EXPERIMENT_ID`  | Yes      | Experiment ID to log traces to                             |
+| `MLFLOW_TRACE_LOCATION` | For UC   | Existing `catalog.schema.table_prefix` trace location      |
 | `MLFLOW_OPENCODE_DEBUG` | No       | Set to `true` to enable debug logging to stderr            |
 
 ### Configuration Examples
@@ -112,6 +121,13 @@ export MLFLOW_EXPERIMENT_ID=123456
 # Databricks MLflow
 export MLFLOW_TRACKING_URI=databricks
 export MLFLOW_EXPERIMENT_ID=123456789
+```
+
+For a Unity Catalog-backed Databricks experiment, also set the existing trace
+location:
+
+```bash
+export MLFLOW_TRACE_LOCATION=my_catalog.my_schema.my_table_prefix
 ```
 
 ## Token Usage
@@ -177,7 +193,8 @@ Debug output is written to stderr to avoid interfering with OpenCode's TUI.
 2. Check that `opencode.json` contains the plugin:
    ```json
    {
-     "plugin": ["@mlflow/opencode"]
+     "$schema": "https://opencode.ai/config.json",
+     "plugins": ["@mlflow/opencode"]
    }
    ```
 
@@ -191,7 +208,8 @@ To stop automatic tracing, remove the plugin from your `opencode.json`:
 
 ```json
 {
-  "plugin": []
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": []
 }
 ```
 

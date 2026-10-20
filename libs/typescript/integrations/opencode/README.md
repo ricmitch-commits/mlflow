@@ -1,6 +1,6 @@
 # @mlflow/opencode
 
-MLflow tracing plugin for [OpenCode](https://opencode.ai).
+MLflow tracing plugin for [OpenCode V2](https://opencode.ai/v2/).
 
 This plugin automatically traces OpenCode conversations to MLflow, capturing:
 
@@ -21,7 +21,8 @@ npm install @mlflow/opencode
 
 ```json
 {
-  "plugin": ["@mlflow/opencode"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["@mlflow/opencode"]
 }
 ```
 
@@ -32,7 +33,15 @@ export MLFLOW_TRACKING_URI=http://localhost:5000
 export MLFLOW_EXPERIMENT_ID=123
 ```
 
-3. Run OpenCode normally - traces are created automatically when sessions become idle.
+3. Run OpenCode normally - traces are created automatically when sessions complete.
+
+OpenCode V2 may return a post-compaction context rather than the full transcript. The integration merges
+ID-bearing messages across idle events so later traces retain available conversation history while keeping
+inactive session state bounded.
+
+The plugin retains message history observed during the active OpenCode process so
+LLM input history remains useful across V2 context compaction. Lifecycle-only
+records such as system and compaction messages are not traced as conversation turns.
 
 ## Configuration
 

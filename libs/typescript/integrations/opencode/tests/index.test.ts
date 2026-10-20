@@ -1,35 +1,23 @@
-/**
- * Tests for MLflow OpenCode integration
- */
+/** Tests for the OpenCode V2 MLflow integration. */
 
-import { MLflowTracingPlugin } from '../src';
-import type { PluginInput } from '@opencode-ai/plugin';
+import type { PluginContext, PluginEvent } from '@opencode/plugin';
+import MLflowTracingPlugin from '../src';
 
-interface PluginClient {
-  session: {
-    messages: jest.Mock;
-  };
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type EventParams = any;
-
-// Mock the @mlflow/core module
 jest.mock('@mlflow/core', () => {
-  const mockSpan = {
+  const createSpan = () => ({
     traceId: 'mock-trace-id',
     setAttribute: jest.fn(),
     setOutputs: jest.fn(),
     end: jest.fn(),
-  };
+  });
+  const parentSpan = createSpan();
 
   return {
+    getParentSpan: jest.fn(() => parentSpan),
     init: jest.fn(),
-    startSpan: jest.fn(() => mockSpan),
-    // withSpan invokes its callback with the parent span so the child-span
-    // logic runs, and returns the callback's result (the traceId string).
-    withSpan: jest.fn((callback: (span: typeof mockSpan) => unknown, _options?: unknown) =>
-      callback(mockSpan),
+    startSpan: jest.fn(createSpan),
+    withSpan: jest.fn((callback: (span: ReturnType<typeof createSpan>) => unknown) =>
+      callback(parentSpan),
     ),
     updateCurrentTrace: jest.fn(),
     flushTraces: jest.fn().mockResolvedValue(undefined),
@@ -44,1338 +32,582 @@ jest.mock('@mlflow/core', () => {
   };
 });
 
-// Import mocked functions after mocking
 import * as mlflowTracing from '@mlflow/core';
 
-describe('MLflowTracingPlugin', () => {
+type MockSpan = {
+  setOutputs: jest.Mock;
+  setAttribute: jest.Mock;
+  end: jest.Mock;
+};
+
+function getParentSpan(): MockSpan {
+  return (mlflowTracing as unknown as { getParentSpan: jest.Mock }).getParentSpan();
+}
+
+interface EventBus {
+  iterable: AsyncIterable<PluginEvent>;
+  emit: (event: PluginEvent) => void;
+  close: () => void;
+}
+
+function createEventBus(): EventBus {
+  const queue: PluginEvent[] = [];
+  const waiters: Array<(event: IteratorResult<PluginEvent>) => void> = [];
+  let closed = false;
+
+  const next = (): Promise<IteratorResult<PluginEvent>> => {
+    if (queue.length > 0) {
+      return Promise.resolve({ done: false, value: queue.shift() as PluginEvent });
+    }
+    if (closed) {
+      return Promise.resolve({ done: true, value: undefined });
+    }
+    return new Promise((resolve) => waiters.push(resolve));
+  };
+
+  return {
+    iterable: {
+      [Symbol.asyncIterator]: () => ({ next }),
+    },
+    emit(event) {
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter({ done: false, value: event });
+      } else {
+        queue.push(event);
+      }
+    },
+    close() {
+      closed = true;
+      for (const waiter of waiters.splice(0)) {
+        waiter({ done: true, value: undefined });
+      }
+    },
+  };
+}
+
+function createUserMessage(text: string, id: string, created = 1) {
+  return {
+    id,
+    type: 'user',
+    text,
+    time: { created },
+  };
+}
+
+function createAssistantMessage(
+  id: string,
+  text: string,
+  options: {
+    modelID?: string;
+    providerID?: string;
+    tokens?: Record<string, unknown>;
+    created?: number;
+    completed?: number;
+    finish?: string;
+    error?: unknown;
+  } = {},
+) {
+  return {
+    id,
+    type: 'assistant',
+    model: {
+      id: options.modelID || 'claude-3-opus',
+      providerID: options.providerID || 'anthropic',
+    },
+    tokens: options.tokens || {
+      input: 100,
+      output: 50,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    },
+    time: {
+      created: options.created || 2,
+      completed: options.completed || 3,
+    },
+    ...(options.finish ? { finish: options.finish } : {}),
+    ...(options.error ? { error: options.error } : {}),
+    content: [{ type: 'text', text }],
+  };
+}
+
+function createToolAssistantMessage() {
+  return {
+    id: 'assistant-tool-1',
+    type: 'assistant',
+    model: { id: 'gpt-4.1', providerID: 'openai' },
+    tokens: {
+      input: 150,
+      output: 40,
+      reasoning: 10,
+      cache: { read: 25, write: 5 },
+    },
+    time: { created: 10, completed: 20 },
+    content: [
+      { type: 'reasoning', text: 'I should inspect the file first.' },
+      {
+        type: 'tool',
+        id: 'call-read-1',
+        name: 'Read',
+        executed: true,
+        time: { created: 11, ran: 12, completed: 18 },
+        state: {
+          status: 'completed',
+          input: { file_path: '/tmp/example.ts' },
+          content: [{ type: 'text', text: 'const answer = 42;' }],
+        },
+      },
+    ],
+  };
+}
+
+function createContext(transcript: unknown): {
+  context: PluginContext;
+  bus: EventBus;
+  sessionContext: jest.Mock;
+  subscribe: jest.Mock;
+} {
+  const bus = createEventBus();
+  const sessionContext = jest.fn().mockResolvedValue(transcript);
+  const subscribe = jest.fn(({ signal }: { signal: AbortSignal }) => {
+    signal.addEventListener('abort', bus.close, { once: true });
+    return bus.iterable;
+  });
+
+  return {
+    context: {
+      event: { subscribe },
+      session: { context: sessionContext },
+    },
+    bus,
+    sessionContext,
+    subscribe,
+  };
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error('Timed out waiting for the OpenCode event subscription');
+}
+
+async function emitIdle(bus: EventBus, sessionID: string, expectedCalls: number): Promise<void> {
+  bus.emit({ type: 'session.idle', data: { sessionID } });
+  await waitFor(() => (mlflowTracing.withSpan as jest.Mock).mock.calls.length >= expectedCalls);
+}
+
+describe('MLflow OpenCode V2 plugin', () => {
   const originalEnv = process.env;
-
-  // Helper to create mock client
-  const createMockClient = (
-    _sessionData: Record<string, unknown> = {},
-    messagesData: unknown[] = [],
-  ): PluginClient => ({
-    session: {
-      messages: jest.fn().mockResolvedValue({ data: messagesData }),
-    },
-  });
-
-  // Helper to create plugin input
-  const createPluginInput = (client: PluginClient): PluginInput =>
-    ({
-      client,
-    }) as unknown as PluginInput;
-
-  // Helper to create event params
-  const createEventParams = (type: string, properties?: Record<string, unknown>): EventParams => ({
-    event: { type, properties },
-  });
-
-  // Helper to create session idle event
-  const createSessionIdleEvent = (sessionID: string): EventParams =>
-    createEventParams('session.idle', { sessionID });
-
-  // Helper to create a user message
-  const createUserMessage = (text: string, time?: { created?: number; completed?: number }) => ({
-    info: {
-      role: 'user',
-      time: time || { created: Date.now(), completed: Date.now() },
-    },
-    parts: [{ type: 'text', text }],
-  });
-
-  // Helper to create an assistant message with text
-  const createAssistantTextMessage = (
-    text: string,
-    options?: {
-      modelID?: string;
-      providerID?: string;
-      tokens?: {
-        input?: number;
-        output?: number;
-        reasoning?: number;
-        cache?: { read?: number; write?: number };
-      };
-      time?: { created?: number; completed?: number };
-    },
-  ) => ({
-    info: {
-      role: 'assistant',
-      modelID: options?.modelID || 'claude-3-opus',
-      providerID: options?.providerID || 'anthropic',
-      tokens: options?.tokens || { input: 100, output: 50 },
-      time: options?.time || { created: Date.now(), completed: Date.now() + 1000 },
-    },
-    parts: [{ type: 'text', text }],
-  });
-
-  // Helper to create an assistant message with tool call
-  const createToolCallMessage = (
-    toolName: string,
-    options?: {
-      callID?: string;
-      status?: string;
-      input?: Record<string, unknown>;
-      output?: string;
-      error?: string;
-      title?: string;
-      time?: { start?: number; end?: number };
-      modelID?: string;
-      providerID?: string;
-    },
-  ) => ({
-    info: {
-      role: 'assistant',
-      modelID: options?.modelID || 'claude-3-opus',
-      providerID: options?.providerID || 'anthropic',
-      time: { created: Date.now(), completed: Date.now() + 1000 },
-    },
-    parts: [
-      {
-        type: 'tool',
-        tool: toolName,
-        callID: options?.callID || `call-${toolName}-${Date.now()}`,
-        state: {
-          status: options?.status || 'completed',
-          input: options?.input || {},
-          output: options?.output || '',
-          error: options?.error,
-          title: options?.title || `${toolName} completed`,
-          time: options?.time || { start: Date.now(), end: Date.now() + 500 },
-        },
-      },
-    ],
-  });
-
-  // Helper to create an assistant message with reasoning and optional text
-  const createAssistantReasoningMessage = (
-    reasoningText: string,
-    text?: string,
-    options?: {
-      modelID?: string;
-      providerID?: string;
-      tokens?: {
-        input?: number;
-        output?: number;
-        reasoning?: number;
-        cache?: { read?: number; write?: number };
-      };
-      time?: { created?: number; completed?: number };
-    },
-  ) => ({
-    info: {
-      role: 'assistant',
-      modelID: options?.modelID || 'claude-3-opus',
-      providerID: options?.providerID || 'anthropic',
-      tokens: options?.tokens || { input: 100, output: 50, reasoning: 30 },
-      time: options?.time || { created: Date.now(), completed: Date.now() + 1000 },
-    },
-    parts: [
-      ...(reasoningText
-        ? [
-            {
-              type: 'reasoning',
-              text: reasoningText,
-              time: { start: Date.now(), end: Date.now() + 500 },
-            },
-          ]
-        : []),
-      ...(text ? [{ type: 'text', text }] : []),
-    ],
-  });
-
-  // Helper to create an assistant message with both text and tool call
-  const createAssistantMessageWithTextAndTool = (
-    text: string,
-    toolName: string,
-    toolOptions?: {
-      callID?: string;
-      status?: string;
-      input?: Record<string, unknown>;
-      output?: string;
-    },
-  ) => ({
-    info: {
-      role: 'assistant',
-      modelID: 'claude-3-opus',
-      providerID: 'anthropic',
-      tokens: { input: 100, output: 50 },
-      time: { created: Date.now(), completed: Date.now() + 1000 },
-    },
-    parts: [
-      { type: 'text', text },
-      {
-        type: 'tool',
-        tool: toolName,
-        callID: toolOptions?.callID || `call-${toolName}`,
-        state: {
-          status: toolOptions?.status || 'completed',
-          input: toolOptions?.input || {},
-          output: toolOptions?.output || '',
-          title: `${toolName} completed`,
-          time: { start: Date.now(), end: Date.now() + 500 },
-        },
-      },
-    ],
-  });
 
   beforeEach(() => {
     jest.clearAllMocks();
-    jest.resetModules();
     process.env = { ...originalEnv };
     delete process.env.MLFLOW_TRACKING_URI;
     delete process.env.MLFLOW_EXPERIMENT_ID;
   });
 
-  afterAll(() => {
+  afterEach(() => {
     process.env = originalEnv;
   });
 
-  describe('Plugin Initialization', () => {
-    it('should export MLflowTracingPlugin function', () => {
-      expect(typeof MLflowTracingPlugin).toBe('function');
-    });
+  it('exports a stable V2 plugin definition and cleans up its subscription', async () => {
+    const { context, subscribe } = createContext([]);
 
-    it('should return a promise with hooks when called', async () => {
-      const mockClient = createMockClient();
-      const result = MLflowTracingPlugin(createPluginInput(mockClient));
+    expect(MLflowTracingPlugin.id).toBe('mlflow-opencode');
+    const cleanup = MLflowTracingPlugin.setup(context);
 
-      expect(result).toBeInstanceOf(Promise);
+    expect(subscribe).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
+    const signal = subscribe.mock.calls[0][0].signal as AbortSignal;
+    expect(signal.aborted).toBe(false);
 
-      const hooks = await result;
-      expect(hooks).toHaveProperty('event');
-      expect(typeof hooks.event).toBe('function');
-    });
+    await (cleanup as () => void | Promise<void>)();
+    expect(signal.aborted).toBe(true);
   });
 
-  describe('Environment Variable Handling', () => {
-    it('should not process when MLFLOW_TRACKING_URI is not set', async () => {
-      const mockClient = createMockClient();
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+  it('uses V2 event data and session context, ignoring unrelated events', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus, sessionContext } = createContext([
+      createUserMessage('Hello', 'user-1'),
+      createAssistantMessage('assistant-1', 'Hi there!'),
+    ]);
+    MLflowTracingPlugin.setup(context);
 
-      await hooks.event!(createSessionIdleEvent('test-session-123'));
+    bus.emit({ type: 'message.updated', data: { sessionID: 'ignored' } });
+    bus.emit({ type: 'session.idle', data: {} });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sessionContext).not.toHaveBeenCalled();
 
-      expect(mockClient.session.messages).not.toHaveBeenCalled();
-    });
-
-    it('should not process when MLFLOW_EXPERIMENT_ID is not set', async () => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      // MLFLOW_EXPERIMENT_ID is not set
-
-      const mockClient = createMockClient();
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('test-session-123'));
-
-      expect(mockClient.session.messages).not.toHaveBeenCalled();
-    });
-
-    it('should initialize SDK when both env variables are set', async () => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-
-      const messages = [createUserMessage('Hello'), createAssistantTextMessage('Hi there!')];
-
-      const mockClient = createMockClient({ title: 'Test Session' }, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('test-session-123'));
-
-      expect(mlflowTracing.init).toHaveBeenCalledWith({
-        trackingUri: 'http://localhost:5000',
-        experimentId: 'exp-123',
-      });
-    });
+    await emitIdle(bus, 'session-1', 1);
+    expect(sessionContext).toHaveBeenCalledWith(
+      { sessionID: 'session-1' },
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(mlflowTracing.withSpan).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({
+        name: 'opencode_conversation',
+        spanType: 'AGENT',
+        inputs: { prompt: 'Hello' },
+      }),
+    );
   });
 
-  describe('Event Filtering', () => {
-    it('should not process non session.idle events', async () => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
+  it('traces a successful execution when OpenCode omits session.idle', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus, sessionContext } = createContext([
+      createUserMessage('Complete this turn', 'user-complete'),
+      createAssistantMessage('assistant-complete', 'Done'),
+    ]);
+    MLflowTracingPlugin.setup(context);
 
-      const mockClient = createMockClient();
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createEventParams('message.updated', {}));
-
-      expect(mockClient.session.messages).not.toHaveBeenCalled();
+    bus.emit({
+      type: 'session.execution.succeeded',
+      data: { sessionID: 'completed-session' },
     });
-
-    it('should not process events without sessionID', async () => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-
-      const mockClient = createMockClient();
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createEventParams('session.idle', {}));
-
-      expect(mockClient.session.messages).not.toHaveBeenCalled();
-    });
+    await waitFor(() => sessionContext.mock.calls.length === 1);
+    expect(mlflowTracing.withSpan).toHaveBeenCalledTimes(1);
   });
 
-  describe('LLM Call Tracing', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
+  it('traces V2 assistant model, token, reasoning, and tool shapes', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus } = createContext([
+      createUserMessage('Read the file', 'user-tool'),
+      createToolAssistantMessage(),
+    ]);
+    MLflowTracingPlugin.setup(context);
+
+    await emitIdle(bus, 'tool-session', 1);
+
+    expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'llm_call',
+        spanType: 'LLM',
+        inputs: expect.objectContaining({ model: 'openai/gpt-4.1' }),
+      }),
+    );
+    expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'tool_Read',
+        spanType: 'TOOL',
+        startTimeNs: 12 * 1e6,
+        inputs: { file_path: '/tmp/example.ts' },
+        attributes: expect.objectContaining({ status: 'completed', tool_id: 'call-read-1' }),
+      }),
+    );
+
+    const llmCall = (mlflowTracing.startSpan as jest.Mock).mock.calls.find(
+      ([options]) => options.name === 'llm_call',
+    );
+    const llmSpan = (mlflowTracing.startSpan as jest.Mock).mock.results.find(
+      (_result, index) =>
+        (mlflowTracing.startSpan as jest.Mock).mock.calls[index][0].name === 'llm_call',
+    )?.value;
+    expect(llmCall?.[0].inputs.messages).toEqual([{ role: 'user', content: 'Read the file' }]);
+    expect(llmSpan.setAttribute).toHaveBeenCalledWith('token_usage', {
+      input_tokens: 150,
+      output_tokens: 40,
+      total_tokens: 200,
+      cache_read_tokens: 25,
+      cache_write_tokens: 5,
     });
-
-    it('should create LLM span for assistant text response', async () => {
-      const messages = [
-        createUserMessage('What is 2+2?'),
-        createAssistantTextMessage('The answer is 4.'),
-      ];
-
-      const mockClient = createMockClient({ title: 'Math Question' }, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('session-1'));
-
-      // Should create parent span (AGENT type) via withSpan
-      expect(mlflowTracing.withSpan).toHaveBeenCalledWith(
-        expect.any(Function),
-        expect.objectContaining({
-          name: 'opencode_conversation',
-          spanType: 'AGENT',
-          inputs: { prompt: 'What is 2+2?' },
-        }),
-      );
-
-      // Should create LLM span
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'llm_call',
-          spanType: 'LLM',
-          inputs: expect.objectContaining({
-            model: 'anthropic/claude-3-opus',
+    expect(llmSpan.setOutputs).toHaveBeenCalledWith({
+      choices: [
+        {
+          message: expect.objectContaining({
+            content: null,
+            reasoning: 'I should inspect the file first.',
+            tool_calls: [
+              expect.objectContaining({
+                id: 'call-read-1',
+                function: expect.objectContaining({ name: 'Read' }),
+              }),
+            ],
           }),
-        }),
-      );
-
-      expect(mlflowTracing.flushTraces).toHaveBeenCalled();
+        },
+      ],
     });
+  });
 
-    it('should track token usage in LLM spans', async () => {
-      const messages = [
-        createUserMessage('Tell me a story'),
-        createAssistantTextMessage('Once upon a time...', {
-          tokens: {
-            input: 150,
-            output: 200,
-            reasoning: 50,
-            cache: { read: 25, write: 10 },
-          },
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('session-tokens'));
-
-      // Verify startSpan was called for LLM
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'llm_call',
-          spanType: 'LLM',
-        }),
-      );
-    });
-
-    it('should create multiple LLM spans for multi-turn conversation', async () => {
-      const messages = [
-        createUserMessage('First question'),
-        createAssistantTextMessage('First answer'),
-        createUserMessage('Second question'),
-        createAssistantTextMessage('Second answer'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      // First idle event processes all messages
-      await hooks.event!(createSessionIdleEvent('multi-turn-session'));
-
-      // Should have created spans
-      expect(mlflowTracing.startSpan).toHaveBeenCalled();
-    });
-
-    it('should handle assistant messages with different models', async () => {
-      const messages = [
-        createUserMessage('Compare models'),
-        createAssistantTextMessage('GPT response', {
-          modelID: 'gpt-4',
-          providerID: 'openai',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('model-comparison'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          inputs: expect.objectContaining({
-            model: 'openai/gpt-4',
-          }),
-        }),
-      );
-    });
-
-    it('should include reasoning content in LLM span outputs', async () => {
-      const messages = [
-        createUserMessage('Are you conscious?'),
-        createAssistantReasoningMessage(
-          'The user is asking a philosophical question about AI consciousness.',
-          "I don't know — that's the most honest answer I can give.",
-        ),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('reasoning-session'));
-      const mockSpan = (mlflowTracing.startSpan as jest.Mock)();
-
-      expect(mockSpan.setOutputs).toHaveBeenCalledWith({
-        choices: [
+  it('preserves V2 structured tool errors and completion timing', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus } = createContext([
+      createUserMessage('Run the command', 'user-error'),
+      {
+        id: 'assistant-error-1',
+        type: 'assistant',
+        model: { id: 'claude-3-opus', providerID: 'anthropic' },
+        time: { created: 20, completed: 30 },
+        content: [
           {
-            message: expect.objectContaining({
-              role: 'assistant',
-              content: "I don't know — that's the most honest answer I can give.",
-              reasoning: 'The user is asking a philosophical question about AI consciousness.',
-            }),
+            type: 'tool',
+            id: 'call-bash-1',
+            name: 'Bash',
+            time: { created: 21, ran: 22, completed: 29 },
+            state: {
+              status: 'error',
+              input: { command: 'not-a-command' },
+              error: { type: 'ProcessError', message: 'Command not found' },
+              content: [{ type: 'text', text: 'The command failed.' }],
+            },
           },
         ],
-      });
+      },
+    ]);
+    MLflowTracingPlugin.setup(context);
+
+    await emitIdle(bus, 'error-session', 1);
+
+    expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'tool_Bash',
+        startTimeNs: 22 * 1e6,
+        attributes: expect.objectContaining({ status: 'error' }),
+      }),
+    );
+    const toolSpan = (mlflowTracing.startSpan as jest.Mock).mock.results.find(
+      (_result, index) =>
+        (mlflowTracing.startSpan as jest.Mock).mock.calls[index][0].name === 'tool_Bash',
+    )?.value;
+    expect(toolSpan.setOutputs).toHaveBeenCalledWith({ error: 'Command not found' });
+    expect(toolSpan.end).toHaveBeenCalledWith({ endTimeNs: 29 * 1e6 });
+  });
+
+  it('preserves assistant finish and error on failed parent traces', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus } = createContext([
+      createUserMessage('Try the request', 'user-failed'),
+      createAssistantMessage('assistant-failed', 'The request stopped.', {
+        finish: 'error',
+        error: { type: 'ProviderError', message: 'Provider unavailable' },
+      }),
+    ]);
+    MLflowTracingPlugin.setup(context);
+
+    bus.emit({
+      type: 'session.execution.failed',
+      data: { sessionID: 'failed-session', error: { message: 'Execution failed' } },
     });
+    await emitIdle(bus, 'failed-session', 1);
 
-    it('should create LLM span for reasoning-only assistant message with empty content', async () => {
-      // Assistant message with reasoning but NO text
-      const messages = [
-        createUserMessage('Think about this deeply'),
-        createAssistantReasoningMessage('Deep internal deliberation about the question...'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      // This runs the real plugin code against our mocked @mlflow/core
-      await hooks.event!(createSessionIdleEvent('reasoning-only-session'));
-
-      // An llm_call span should still be created even without text
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'llm_call',
-          spanType: 'LLM',
-        }),
-      );
-      // NOTE : All tests in this file follow the pattern below ##
-      // The plugin calls startSpan() multiple times internally:
-      //   const parentSpan = startSpan({name: 'opencode_conversation', ...})
-      //   const llmSpan    = startSpan({name: 'llm_call', ...})
-      //   const toolSpan   = startSpan({name: 'tool_X', ...})   (if tools exist)
-      // mockSpan.setOutputs.mock.calls collects calls from ALL spans.
-      // We care about the llmSpan.setOutputs() call specifically. [0] works
-      // because only the LLM span calls setOutputs before the parent span does.
-      const mockSpan = (mlflowTracing.startSpan as jest.Mock)();
-      const outputCall = mockSpan.setOutputs.mock.calls[0][0];
-
-      expect(outputCall.choices[0].message.content).toBeNull();
-      expect(outputCall.choices[0].message.reasoning).toBe(
-        'Deep internal deliberation about the question...',
-      );
-
-      // extractAssistantResponse only looks at text parts, so reasoning-only
-      // messages intentionally leave responsePreview out of updateCurrentTrace.
-      const traceUpdate = (mlflowTracing.updateCurrentTrace as jest.Mock).mock.calls[0][0];
-      expect(traceUpdate).not.toHaveProperty('responsePreview');
-    });
-
-    it('should not include reasoning field when no reasoning parts exist', async () => {
-      const messages = [createUserMessage('Hello'), createAssistantTextMessage('Hi there!')];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('no-reasoning-session'));
-
-      const mockSpan = (mlflowTracing.startSpan as jest.Mock)();
-      // first argument when setOutputs got called first time
-      const outputCall = mockSpan.setOutputs.mock.calls[0][0];
-      expect(outputCall.choices[0].message).not.toHaveProperty('reasoning');
+    expect(getParentSpan().setOutputs).toHaveBeenCalledWith({
+      response: 'The request stopped.',
+      status: 'failed',
+      error: 'Execution failed',
+      finish: 'error',
     });
   });
 
-  describe('Tool Call Tracing', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
+  it('preserves an interrupted session.idle outcome on the parent trace', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus } = createContext([
+      createUserMessage('Stop this work', 'user-interrupted'),
+      createAssistantMessage('assistant-interrupted', 'Partial response', { finish: 'stop' }),
+    ]);
+    MLflowTracingPlugin.setup(context);
+
+    bus.emit({
+      type: 'session.idle',
+      data: { sessionID: 'interrupted-session', outcome: 'interrupted', reason: 'user' },
     });
+    await emitIdle(bus, 'interrupted-session', 1);
 
-    it('should create tool span for completed tool call', async () => {
-      const messages = [
-        createUserMessage('Read a file'),
-        createToolCallMessage('Read', {
-          callID: 'read-call-1',
-          status: 'completed',
-          input: { file_path: '/test/file.txt' },
-          output: 'File contents here',
-          title: 'Read file.txt',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('tool-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Read',
-          spanType: 'TOOL',
-          inputs: { file_path: '/test/file.txt' },
-          attributes: expect.objectContaining({
-            tool_name: 'Read',
-            tool_id: 'read-call-1',
-            status: 'completed',
-          }),
-        }),
-      );
-    });
-
-    it('should handle errored tool calls', async () => {
-      const messages = [
-        createUserMessage('Run a command'),
-        createToolCallMessage('Bash', {
-          callID: 'bash-call-1',
-          status: 'error',
-          input: { command: 'invalid-command' },
-          error: 'Command not found',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('error-tool-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Bash',
-          spanType: 'TOOL',
-          attributes: expect.objectContaining({
-            status: 'error',
-          }),
-        }),
-      );
-    });
-
-    it('should handle multiple tool calls in sequence', async () => {
-      const messages = [
-        createUserMessage('List and read files'),
-        createToolCallMessage('Glob', {
-          callID: 'glob-call-1',
-          input: { pattern: '*.ts' },
-          output: 'file1.ts\nfile2.ts',
-        }),
-        createToolCallMessage('Read', {
-          callID: 'read-call-1',
-          input: { file_path: 'file1.ts' },
-          output: 'console.log("hello");',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('multi-tool-session'));
-
-      // Should create spans for both tools
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Glob',
-        }),
-      );
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Read',
-        }),
-      );
-    });
-
-    it('should handle message with both text and tool call', async () => {
-      const messages = [
-        createUserMessage('Explain and read file'),
-        createAssistantMessageWithTextAndTool("I'll read the file for you.", 'Read', {
-          input: { file_path: '/test/example.ts' },
-          output: 'const x = 1;',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('text-and-tool-session'));
-
-      // Should create both LLM and tool spans
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'llm_call',
-          spanType: 'LLM',
-        }),
-      );
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Read',
-          spanType: 'TOOL',
-        }),
-      );
-    });
-
-    it('should handle Edit tool with file modifications', async () => {
-      const messages = [
-        createUserMessage('Fix the bug'),
-        createToolCallMessage('Edit', {
-          callID: 'edit-call-1',
-          status: 'completed',
-          input: {
-            file_path: '/src/index.ts',
-            old_string: 'const x = 1',
-            new_string: 'const x = 2',
-          },
-          output: 'File edited successfully',
-          title: 'Edit index.ts',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('edit-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Edit',
-          spanType: 'TOOL',
-          inputs: expect.objectContaining({
-            file_path: '/src/index.ts',
-          }),
-        }),
-      );
-    });
-
-    it('should handle Write tool for file creation', async () => {
-      const messages = [
-        createUserMessage('Create a new file'),
-        createToolCallMessage('Write', {
-          callID: 'write-call-1',
-          status: 'completed',
-          input: {
-            file_path: '/src/new-file.ts',
-            content: 'export const hello = "world";',
-          },
-          output: 'File created',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('write-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Write',
-          spanType: 'TOOL',
-        }),
-      );
-    });
-
-    it('should handle Bash tool execution', async () => {
-      const messages = [
-        createUserMessage('Run the tests'),
-        createToolCallMessage('Bash', {
-          callID: 'bash-call-1',
-          status: 'completed',
-          input: { command: 'npm test' },
-          output: 'All tests passed',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('bash-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Bash',
-          spanType: 'TOOL',
-          inputs: { command: 'npm test' },
-        }),
-      );
+    expect(getParentSpan().setOutputs).toHaveBeenCalledWith({
+      response: 'Partial response',
+      status: 'interrupted',
+      finish: 'stop',
+      reason: 'user',
     });
   });
 
-  describe('Agent Workflow Tracing', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-    });
+  it('preserves prior V2 messages in incremental conversation history', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    let transcript: unknown[] = [
+      createUserMessage('First question', 'user-1'),
+      createAssistantMessage('assistant-1', 'First answer'),
+    ];
+    const { context, bus, sessionContext } = createContext(transcript);
+    sessionContext.mockImplementation(() => Promise.resolve(transcript));
+    MLflowTracingPlugin.setup(context);
 
-    it('should trace complete agent workflow with LLM + tools + response', async () => {
-      const messages = [
-        createUserMessage('Find all TypeScript files and count them'),
-        createToolCallMessage('Glob', {
-          callID: 'glob-1',
-          input: { pattern: '**/*.ts' },
-          output: 'src/index.ts\nsrc/utils.ts\nsrc/types.ts',
-        }),
-        createAssistantTextMessage('I found 3 TypeScript files in the project.'),
-      ];
+    await emitIdle(bus, 'incremental-session', 1);
+    transcript = [
+      ...transcript,
+      createUserMessage('Second question', 'user-2', 4),
+      createAssistantMessage('assistant-2', 'Second answer', { created: 5, completed: 6 }),
+    ];
+    await emitIdle(bus, 'incremental-session', 2);
 
-      const mockClient = createMockClient({ title: 'File Count' }, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('agent-workflow'));
-
-      // Should create parent AGENT span via withSpan
-      expect(mlflowTracing.withSpan).toHaveBeenCalledWith(
-        expect.any(Function),
-        expect.objectContaining({
-          name: 'opencode_conversation',
-          spanType: 'AGENT',
-        }),
-      );
-
-      // Should create TOOL span
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Glob',
-          spanType: 'TOOL',
-        }),
-      );
-
-      // Should create LLM span
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'llm_call',
-          spanType: 'LLM',
-        }),
-      );
-    });
-
-    it('should trace complex multi-step agent workflow', async () => {
-      const messages = [
-        createUserMessage('Implement a new function'),
-        createToolCallMessage('Read', {
-          callID: 'read-1',
-          input: { file_path: '/src/utils.ts' },
-          output: 'export function existing() {}',
-        }),
-        createToolCallMessage('Edit', {
-          callID: 'edit-1',
-          input: { file_path: '/src/utils.ts', old_string: '{}', new_string: '{ return true; }' },
-          output: 'Edited',
-        }),
-        createAssistantTextMessage('I have updated the function.'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('multi-step-agent'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({ name: 'tool_Read' }),
-      );
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({ name: 'tool_Edit' }),
-      );
-
-      // LLM spans must be created for every assistant message, including
-      // tool-call-only responses (Read, Edit) and the final text response.
-      const llmCalls = (mlflowTracing.startSpan as jest.Mock).mock.calls.filter(
-        ([opts]: [{ spanType?: string }]) => opts.spanType === 'LLM',
-      );
-      expect(llmCalls.length).toBe(3);
-    });
-
-    it('should create LLM span for tool-call-only assistant messages', async () => {
-      // Reproduces: LLM calls with no text output (only tool calls) were silently
-      // dropped, causing empty traces when agents like prometheus issue many
-      // back-to-back tool calls without intermediate text.
-      const messages = [
-        createUserMessage('Create a complex plan'),
-        createToolCallMessage('Read', {
-          callID: 'read-1',
-          input: { file_path: '/src/plan.ts' },
-          output: 'current content',
-        }),
-        createToolCallMessage('Bash', {
-          callID: 'bash-1',
-          input: { command: 'ls -la' },
-          output: 'file list',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('tool-only-session'));
-
-      // Each tool-call-only assistant message must produce an LLM span
-      const llmCalls = (mlflowTracing.startSpan as jest.Mock).mock.calls.filter(
-        ([opts]: [{ spanType?: string }]) => opts.spanType === 'LLM',
-      );
-      expect(llmCalls.length).toBe(2);
-
-      // The LLM span outputs should include tool_calls in the OpenAI chat-completion
-      // shape ({id, type: 'function', function: {name, arguments}}) so MLflow's Chat
-      // view can render them, consistent with the other integrations.
-      type OutputMessage = {
-        role: string;
-        content: string | null;
-        tool_calls?: Array<{
-          id: string;
-          type: string;
-          function: { name: string; arguments: string };
-        }>;
-      };
-      const setOutputsCalls = (mlflowTracing.startSpan as jest.Mock).mock.results[0].value
-        .setOutputs.mock.calls as Array<[{ choices?: Array<{ message?: OutputMessage }> }]>;
-      const toolCallMessages = setOutputsCalls
-        .map(([outputs]) => outputs?.choices?.[0]?.message)
-        .filter((message): message is OutputMessage => Boolean(message?.tool_calls));
-      expect(toolCallMessages).toHaveLength(2);
-      for (const message of toolCallMessages) {
-        // tool-call-only responses carry null content (OpenAI convention)
-        expect(message.content).toBeNull();
-        for (const toolCall of message.tool_calls ?? []) {
-          expect(typeof toolCall.id).toBe('string');
-          expect(toolCall.type).toBe('function');
-          expect(typeof toolCall.function.name).toBe('string');
-          // arguments must be a JSON string, not a raw object
-          expect(typeof toolCall.function.arguments).toBe('string');
-        }
-      }
-      const firstToolCall = toolCallMessages[0].tool_calls?.[0];
-      expect(firstToolCall?.function.name).toBe('Read');
-      expect(JSON.parse(firstToolCall?.function.arguments ?? '{}')).toEqual({
-        file_path: '/src/plan.ts',
-      });
-    });
+    const llmCalls = (mlflowTracing.startSpan as jest.Mock).mock.calls.filter(
+      ([options]) => options.name === 'llm_call',
+    );
+    expect(llmCalls).toHaveLength(2);
+    expect(llmCalls[1][0].inputs.messages).toEqual([
+      { role: 'user', content: 'First question' },
+      { role: 'assistant', content: 'First answer' },
+      { role: 'user', content: 'Second question' },
+    ]);
   });
 
-  describe('Edge Cases', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-    });
+  it('merges post-compaction V2 context with the retained ID-keyed transcript', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    let contextMessages: unknown[] = [
+      createUserMessage('Before compaction', 'user-before'),
+      createAssistantMessage('assistant-before', 'Earlier answer'),
+    ];
+    const { context, bus, sessionContext } = createContext(contextMessages);
+    sessionContext.mockImplementation(() => Promise.resolve(contextMessages));
+    MLflowTracingPlugin.setup(context);
 
-    it('should handle empty messages array', async () => {
-      const mockClient = createMockClient({}, []);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+    await emitIdle(bus, 'compaction-session', 1);
+    contextMessages = [
+      createUserMessage('After compaction', 'user-after', 4),
+      createAssistantMessage('assistant-after', 'Later answer', { created: 5, completed: 6 }),
+    ];
+    await emitIdle(bus, 'compaction-session', 2);
 
-      await hooks.event!(createSessionIdleEvent('empty-session'));
-
-      // Should not create a trace
-      expect(mlflowTracing.withSpan).not.toHaveBeenCalled();
-    });
-
-    it('should handle session with no user messages', async () => {
-      const messages = [createAssistantTextMessage('Hello!')];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('no-user-session'));
-
-      // Should not create trace without user message
-      expect(mlflowTracing.withSpan).not.toHaveBeenCalled();
-    });
-
-    it('should handle user message with empty text', async () => {
-      const messages = [
-        { info: { role: 'user' }, parts: [{ type: 'text', text: '' }] },
-        createAssistantTextMessage('Response'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('empty-user-text'));
-
-      // Should not create trace with empty user prompt
-      expect(mlflowTracing.withSpan).not.toHaveBeenCalled();
-    });
-
-    it('should handle messages with missing parts', async () => {
-      const messages = [
-        { info: { role: 'user' }, parts: undefined },
-        createAssistantTextMessage('Response'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('missing-parts'));
-
-      // Should handle gracefully and not create a trace
-      expect(mlflowTracing.withSpan).not.toHaveBeenCalled();
-    });
-
-    it('should handle tool call with missing state', async () => {
-      const messages = [
-        createUserMessage('Do something'),
-        {
-          info: { role: 'assistant' },
-          parts: [{ type: 'tool', tool: 'Unknown', callID: 'unknown-1' }],
-        },
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('missing-state'));
-
-      // Should still create tool span with defaults
-      expect(mlflowTracing.startSpan).toHaveBeenCalled();
-    });
-
-    it('should handle messages fetch failure', async () => {
-      const mockClient = {
-        session: {
-          messages: jest.fn().mockResolvedValue({ data: null }),
-        },
-      };
-
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient as PluginClient));
-
-      await hooks.event!(createSessionIdleEvent('messages-failure'));
-
-      expect(mlflowTracing.withSpan).not.toHaveBeenCalled();
-    });
+    const llmCalls = (mlflowTracing.startSpan as jest.Mock).mock.calls.filter(
+      ([options]) => options.name === 'llm_call',
+    );
+    expect(llmCalls[1][0].inputs.messages).toEqual([
+      { role: 'user', content: 'Before compaction' },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'After compaction' },
+    ]);
   });
 
-  describe('Duplicate Turn Prevention', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-    });
+  it('creates a meaningful prompt for a file-only user message', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus } = createContext([
+      {
+        id: 'user-file-only',
+        type: 'user',
+        text: '',
+        files: [{ name: 'report.csv', mime: 'text/csv', description: 'the uploaded report' }],
+        time: { created: 1 },
+      },
+      createAssistantMessage('assistant-file-only', 'I will inspect the report.'),
+    ]);
+    MLflowTracingPlugin.setup(context);
 
-    it('should not process the same turn twice', async () => {
-      const messages = [createUserMessage('Hello'), createAssistantTextMessage('Hi!')];
+    await emitIdle(bus, 'file-only-session', 1);
 
-      const mockClient = createMockClient({ title: 'Test' }, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      // First event
-      await hooks.event!(createSessionIdleEvent('dup-session'));
-
-      const firstCallCount = (mlflowTracing.startSpan as jest.Mock).mock.calls.length;
-
-      // Same session, same message count - should be skipped
-      await hooks.event!(createSessionIdleEvent('dup-session'));
-
-      expect((mlflowTracing.startSpan as jest.Mock).mock.calls.length).toBe(firstCallCount);
-    });
-
-    it('should process new messages in existing session', async () => {
-      const initialMessages = [
-        createUserMessage('First'),
-        createAssistantTextMessage('First response'),
-      ];
-
-      let currentMessages = [...initialMessages];
-
-      const mockClient = {
-        session: {
-          messages: jest.fn().mockImplementation(() => Promise.resolve({ data: currentMessages })),
-        },
-      };
-
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient as PluginClient));
-
-      // First turn
-      await hooks.event!(createSessionIdleEvent('incremental-session'));
-
-      const firstCallCount = (mlflowTracing.startSpan as jest.Mock).mock.calls.length;
-
-      // Add new messages
-      currentMessages = [
-        ...initialMessages,
-        createUserMessage('Second'),
-        createAssistantTextMessage('Second response'),
-      ];
-
-      // Second turn with new messages
-      await hooks.event!(createSessionIdleEvent('incremental-session'));
-
-      // Should have more spans now
-      expect((mlflowTracing.startSpan as jest.Mock).mock.calls.length).toBeGreaterThan(
-        firstCallCount,
-      );
-    });
+    expect(mlflowTracing.withSpan).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({
+        inputs: { prompt: 'Attached files: report.csv: the uploaded report' },
+      }),
+    );
+    expect(mlflowTracing.updateCurrentTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestPreview: 'Attached files: report.csv: the uploaded report',
+      }),
+    );
   });
 
-  describe('Trace Metadata', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-      process.env.USER = 'test-user';
-    });
-
-    it('should set trace metadata with session info', async () => {
-      const messages = [
-        createUserMessage('Test prompt'),
-        createAssistantTextMessage('Test response'),
-      ];
-
-      const mockClient = createMockClient(
-        {
-          title: 'Test Session Title',
-          directory: '/custom/directory',
-        },
-        messages,
-      );
-
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('metadata-session'));
-
-      // Verify trace metadata is attached via the public updateCurrentTrace API
-      expect(mlflowTracing.updateCurrentTrace).toHaveBeenCalledWith(
-        expect.objectContaining({
-          metadata: {
-            'mlflow.trace.session': 'metadata-session',
-            'mlflow.trace.user': 'test-user',
-          },
-          requestPreview: 'Test prompt',
-          responsePreview: 'Test response',
+  it('keeps consuming events while MLflow export is slow', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus, sessionContext } = createContext([
+      createUserMessage('Slow export', 'user-slow'),
+      createAssistantMessage('assistant-slow', 'Working'),
+    ]);
+    const releaseExports: Array<() => void> = [];
+    (mlflowTracing.flushTraces as jest.Mock).mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseExports.push(resolve);
         }),
-      );
-    });
+    );
+    const cleanup = MLflowTracingPlugin.setup(context);
+
+    bus.emit({ type: 'session.idle', data: { sessionID: 'slow-session-1' } });
+    await waitFor(() => sessionContext.mock.calls.length === 1);
+    bus.emit({ type: 'session.idle', data: { sessionID: 'slow-session-2' } });
+    await waitFor(() => sessionContext.mock.calls.length === 2);
+
+    expect(sessionContext).toHaveBeenCalledTimes(2);
+    for (const releaseExport of releaseExports) {
+      releaseExport();
+    }
+    await (cleanup as () => void | Promise<void>)();
   });
 
-  describe('Timing Information', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
+  it('reconnects the event subscription after it ends', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, subscribe } = createContext([
+      createUserMessage('Reconnect', 'user-reconnect'),
+      createAssistantMessage('assistant-reconnect', 'Reconnected'),
+    ]);
+    const first = createEventBus();
+    const second = createEventBus();
+    let subscriptions = 0;
+    subscribe.mockImplementation(({ signal }: { signal: AbortSignal }) => {
+      const bus = subscriptions++ === 0 ? first : second;
+      signal.addEventListener('abort', bus.close, { once: true });
+      return bus.iterable;
     });
+    const cleanup = MLflowTracingPlugin.setup(context);
+    expect(subscribe).toHaveBeenCalledTimes(1);
 
-    it('should pass timing information to spans', async () => {
-      const startTime = Date.now();
-      const endTime = startTime + 5000;
+    first.close();
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    expect(subscribe.mock.calls.length).toBeGreaterThanOrEqual(2);
 
-      const messages = [
-        createUserMessage('Timed request', { created: startTime, completed: startTime + 100 }),
-        createAssistantTextMessage('Timed response', {
-          time: { created: startTime + 100, completed: endTime },
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('timing-session'));
-
-      // Verify spans were created with timing
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          startTimeNs: expect.any(Number),
-        }),
-      );
-    });
-
-    it('should handle tool timing information', async () => {
-      const toolStart = Date.now();
-      const toolEnd = toolStart + 1000;
-
-      const messages = [
-        createUserMessage('Run tool'),
-        createToolCallMessage('Read', {
-          time: { start: toolStart, end: toolEnd },
-          input: { file_path: '/test.ts' },
-          output: 'content',
-        }),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('tool-timing-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'tool_Read',
-          startTimeNs: expect.any(Number),
-        }),
-      );
-    });
+    second.emit({ type: 'session.idle', data: { sessionID: 'reconnected-session' } });
+    await waitFor(() => (mlflowTracing.withSpan as jest.Mock).mock.calls.length === 1);
+    await (cleanup as () => void | Promise<void>)();
   });
 
-  describe('Conversation History Reconstruction', () => {
-    beforeEach(() => {
-      process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
-      process.env.MLFLOW_EXPERIMENT_ID = 'exp-123';
-    });
+  it('aborts context retrieval during bounded cleanup', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus, sessionContext } = createContext([]);
+    let requestSignal: AbortSignal | undefined;
+    sessionContext.mockImplementation(
+      (_input: unknown, options?: { signal?: AbortSignal }) =>
+        new Promise<unknown[]>((_resolve, reject) => {
+          requestSignal = options?.signal;
+          options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), {
+            once: true,
+          });
+        }),
+    );
+    const cleanup = MLflowTracingPlugin.setup(context);
+    bus.emit({ type: 'session.idle', data: { sessionID: 'cancel-session' } });
+    await waitFor(() => requestSignal !== undefined);
 
-    it('should reconstruct conversation history for LLM inputs', async () => {
-      const messages = [
-        createUserMessage('What is TypeScript?'),
-        createAssistantTextMessage('TypeScript is a typed superset of JavaScript.'),
-        createUserMessage('How do I install it?'),
-        createAssistantTextMessage('Run npm install -g typescript'),
-      ];
+    await (cleanup as () => void | Promise<void>)();
+    expect(requestSignal?.aborted).toBe(true);
+  });
 
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
+  it('does not create duplicate traces for repeated idle events', async () => {
+    process.env.MLFLOW_TRACKING_URI = 'http://localhost:5000';
+    process.env.MLFLOW_EXPERIMENT_ID = '123';
+    const { context, bus } = createContext([
+      createUserMessage('Repeat-safe', 'stable-user-id'),
+      createAssistantMessage('Only once', 'stable-assistant-id'),
+    ]);
+    MLflowTracingPlugin.setup(context);
 
-      await hooks.event!(createSessionIdleEvent('history-session'));
+    await emitIdle(bus, 'duplicate-session', 1);
+    bus.emit({ type: 'session.idle', data: { sessionID: 'duplicate-session' } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
-      // The second LLM call should include the full conversation history
-      expect(mlflowTracing.startSpan).toHaveBeenCalled();
-    });
-
-    it('should include tool results in conversation history', async () => {
-      const messages = [
-        createUserMessage('List files'),
-        {
-          info: { role: 'assistant' },
-          parts: [
-            {
-              type: 'tool',
-              tool: 'Glob',
-              callID: 'glob-1',
-              state: {
-                status: 'completed',
-                input: { pattern: '*.ts' },
-                output: 'index.ts\nutils.ts',
-              },
-            },
-          ],
-        },
-        createUserMessage('What do they contain?'),
-        createAssistantTextMessage('The files contain TypeScript code.'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('tool-history-session'));
-
-      expect(mlflowTracing.startSpan).toHaveBeenCalled();
-    });
-
-    it('should include reasoning from prior assistant messages in conversation history', async () => {
-      // The plugin only traces messages after the last user message.
-      // So messages[3] (assistant) is the only LLM span created,
-      // but input to this span (inputs.messages) should include the conversation history
-      // from messages [0]-[2], including reasoning part as well from message[1].
-      const messages = [
-        createUserMessage('Are you conscious?'),
-        createAssistantReasoningMessage(
-          'The user is asking a philosophical question.',
-          "I don't know.",
-        ),
-        createUserMessage('Tell me more'),
-        createAssistantTextMessage('Here is more detail.'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('reasoning-history-session'));
-
-      // Find the llm_call span — its inputs.messages should contain
-      // the prior assistant message's reasoning in the conversation history
-      const llmCalls = (mlflowTracing.startSpan as jest.Mock).mock.calls.filter(
-        (call: [{ name: string }]) => call[0].name === 'llm_call',
-      );
-      expect(llmCalls.length).toBe(1);
-
-      const inputMessages = llmCalls[0][0].inputs.messages;
-      const assistantHistoryMsg = inputMessages.find(
-        (m: { role: string }) => m.role === 'assistant',
-      );
-      expect(assistantHistoryMsg).toBeDefined();
-      expect(assistantHistoryMsg.reasoning).toBe('The user is asking a philosophical question.');
-      expect(assistantHistoryMsg.content).toBe("I don't know.");
-    });
-
-    it('should reconstruct full conversation history with reasoning, tools, and continuation messages', async () => {
-      // Modeled after a real OpenCode session where the assistant acts
-      // autonomously across multiple messages:
-      //   user asks → assistant reasons + calls tool → assistant continues
-      //   autonomously (analyzes tool output, calls more tools) → user
-      //   asks follow-up → assistant responds (traced span)
-      //
-      // Key pattern: messages [3] and [4] are both assistant with no user
-      // message between them — [3] calls a tool, [4] autonomously analyzes
-      // the result and calls another tool.
-      const messages = [
-        // [0] Turn 1: user asks a question
-        createUserMessage('Are you conscious?'),
-
-        // [1] Turn 1: assistant responds with reasoning + text
-        createAssistantReasoningMessage(
-          'The user is asking about consciousness, not a coding question.',
-          "I don't know. I process language but can't verify subjective experience.",
-        ),
-
-        // [2] Turn 2: user asks to find files
-        createUserMessage('Find all files in the parent directory'),
-
-        // [3] Turn 2: assistant reasons, explains, and calls read tool
-        {
-          info: {
-            role: 'assistant',
-            modelID: 'claude-opus',
-            providerID: 'anthropic',
-            tokens: { input: 200, output: 100, reasoning: 40 },
-            time: { created: 1000, completed: 2000 },
-          },
-          parts: [
-            {
-              type: 'reasoning',
-              text: 'The user wants to list files. I should use the read tool.',
-              time: { start: 1000, end: 1200 },
-            },
-            { type: 'text', text: "I'll read the parent directory for you." },
-            {
-              type: 'tool',
-              tool: 'read',
-              callID: 'call-read-1',
-              state: {
-                status: 'completed',
-                input: { path: '..' },
-                output: 'src/\npackage.json\nREADME.md',
-                title: 'Read directory',
-                time: { start: 1200, end: 1500 },
-              },
-            },
-          ],
-        },
-
-        // [4] Turn 2 continued: assistant autonomously analyzes the tool
-        // output and calls another tool — no user message in between
-        {
-          info: {
-            role: 'assistant',
-            modelID: 'claude-opus',
-            providerID: 'anthropic',
-            tokens: { input: 300, output: 80 },
-            time: { created: 2001, completed: 3000 },
-          },
-          parts: [
-            {
-              type: 'reasoning',
-              text: 'I see 3 entries. Let me also check the src/ directory contents.',
-              time: { start: 2001, end: 2200 },
-            },
-            { type: 'text', text: 'Found 3 entries. Let me also check what is inside src/.' },
-            {
-              type: 'tool',
-              tool: 'read',
-              callID: 'call-read-2',
-              state: {
-                status: 'completed',
-                input: { path: '../src' },
-                output: 'index.ts\nutils.ts\nconfig.ts',
-                title: 'Read src directory',
-                time: { start: 2200, end: 2500 },
-              },
-            },
-          ],
-        },
-
-        // [5] Turn 2 continued: assistant gives final summary
-        createAssistantTextMessage(
-          'The parent directory has 3 entries. The src/ folder contains index.ts, utils.ts, and config.ts.',
-        ),
-
-        // [6] Turn 3: user asks follow-up
-        createUserMessage('What does index.ts export?'),
-
-        // [7] Turn 3: assistant responds (this is the span we trace)
-        createAssistantTextMessage('index.ts exports the main plugin function.'),
-      ];
-
-      const mockClient = createMockClient({}, messages);
-      const hooks = await MLflowTracingPlugin(createPluginInput(mockClient));
-
-      await hooks.event!(createSessionIdleEvent('full-history-session'));
-
-      // The plugin creates spans from lastUserIdx (6) + 1 = message[7].
-      // message[7]'s LLM span inputs.messages should contain the full
-      // conversation history from messages [0]-[6].
-      const llmCalls = (mlflowTracing.startSpan as jest.Mock).mock.calls.filter(
-        (call: [{ name: string }]) => call[0].name === 'llm_call',
-      );
-      expect(llmCalls.length).toBe(1);
-
-      const history = llmCalls[0][0].inputs.messages;
-
-      // Expected history structure:
-      //   user: "Are you conscious?"
-      //   assistant: text + reasoning (turn 1)
-      //   user: "Find all files..."
-      //   assistant: text + reasoning (turn 2 step 1, called read tool)
-      //   tool: read result "src/\npackage.json\nREADME.md"
-      //   assistant: text + reasoning (turn 2 step 2, autonomous continuation)
-      //   tool: read result "index.ts\nutils.ts\nconfig.ts"
-      //   assistant: text only (turn 2 final summary)
-      //   user: "What does index.ts export?"
-
-      // Check user messages
-      const userMsgs = history.filter((m: { role: string }) => m.role === 'user');
-      expect(userMsgs.length).toBe(3);
-      expect(userMsgs[0].content).toBe('Are you conscious?');
-      expect(userMsgs[1].content).toBe('Find all files in the parent directory');
-      expect(userMsgs[2].content).toBe('What does index.ts export?');
-
-      // Check assistant messages — should include reasoning where it existed
-      const assistantMsgs = history.filter((m: { role: string }) => m.role === 'assistant');
-      expect(assistantMsgs.length).toBe(4);
-
-      // Turn 1 assistant: had reasoning
-      expect(assistantMsgs[0].reasoning).toBe(
-        'The user is asking about consciousness, not a coding question.',
-      );
-      expect(assistantMsgs[0].content).toBe(
-        "I don't know. I process language but can't verify subjective experience.",
-      );
-
-      // Turn 2 step 1: had reasoning + tool call
-      expect(assistantMsgs[1].reasoning).toBe(
-        'The user wants to list files. I should use the read tool.',
-      );
-      expect(assistantMsgs[1].content).toBe("I'll read the parent directory for you.");
-
-      // Turn 2 step 2: autonomous continuation with reasoning
-      expect(assistantMsgs[2].reasoning).toBe(
-        'I see 3 entries. Let me also check the src/ directory contents.',
-      );
-      expect(assistantMsgs[2].content).toBe(
-        'Found 3 entries. Let me also check what is inside src/.',
-      );
-
-      // Turn 2 final: summary, no reasoning
-      expect(assistantMsgs[3].content).toBe(
-        'The parent directory has 3 entries. The src/ folder contains index.ts, utils.ts, and config.ts.',
-      );
-      expect(assistantMsgs[3].reasoning).toBeUndefined();
-
-      // Check tool results — both tool calls should be in history
-      const toolMsgs = history.filter((m: { role: string }) => m.role === 'tool');
-      expect(toolMsgs.length).toBe(2);
-      expect(toolMsgs[0].tool_call_id).toBe('call-read-1');
-      expect(toolMsgs[0].content).toBe('src/\npackage.json\nREADME.md');
-      expect(toolMsgs[1].tool_call_id).toBe('call-read-2');
-      expect(toolMsgs[1].content).toBe('index.ts\nutils.ts\nconfig.ts');
-    });
+    expect(mlflowTracing.withSpan).toHaveBeenCalledTimes(1);
   });
 });

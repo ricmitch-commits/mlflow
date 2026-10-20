@@ -1,3 +1,4 @@
+// Keep the Jest configuration CommonJS while the package itself is ESM.
 const path = require('path');
 
 /** @type {import('ts-jest').JestConfigWithTsJest} */
@@ -22,7 +23,7 @@ module.exports = {
           types: ['jest', 'node'],
           baseUrl: '.',
           paths: {
-            '@opencode-ai/plugin': ['./tests/__mocks__/@opencode-ai/plugin.ts'],
+            '@opencode/plugin': ['./tests/__mocks__/@opencode/plugin.ts'],
             '@mlflow/core': ['../../core/src/index.ts'],
             '@mlflow/core/*': ['../../core/src/*'],
           },
@@ -31,7 +32,7 @@ module.exports = {
     ],
   },
   moduleNameMapper: {
-    '^@opencode-ai/plugin$': '<rootDir>/tests/__mocks__/@opencode-ai/plugin.ts',
+    '^@opencode/plugin$': '<rootDir>/tests/__mocks__/@opencode/plugin.ts',
     '^@mlflow/core$': '<rootDir>/../../core/src',
     '^@mlflow/core/(.*)$': '<rootDir>/../../core/src/$1',
   },
